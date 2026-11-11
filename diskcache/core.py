@@ -45,6 +45,27 @@ MODE_BINARY = 2
 MODE_TEXT = 3
 MODE_PICKLE = 4
 
+# Multi-tag match modes for Cache.query_tags and Cache.evict_tags.
+MATCH_ANY = 'any'  # Union: item matches when any requested tag is associated.
+MATCH_ALL = 'all'  # Intersection: item matches when every requested tag is
+# associated.
+
+_MATCH_ALIASES = {
+    'any': MATCH_ANY,
+    'union': MATCH_ANY,
+    'or': MATCH_ANY,
+    'all': MATCH_ALL,
+    'intersection': MATCH_ALL,
+    'and': MATCH_ALL,
+}
+
+# Schema version for the CacheTag association table. Bump when the table
+# layout changes. Stored in the Settings table under this key.
+TAG_SCHEMA_SETTING = 'tag_schema_version'
+TAG_SCHEMA_VERSION = 1
+
+_TAG_BATCH_SIZE = 100
+
 DEFAULT_SETTINGS = {
     'statistics': 0,  # False
     'tag_index': 0,  # False
@@ -384,6 +405,184 @@ class EmptyDirWarning(UserWarning):
     """Warning used by Cache.check for empty directories."""
 
 
+class TagEvictResult:
+    """Result of a multi-tag eviction across cache shards.
+
+    The object compares equal to its integer total so callers that simply need
+    a count can use it like the integer returned by
+    :meth:`Cache.evict`. Additional attributes make the atomic boundary of the
+    operation explicit:
+
+    * ``total`` - number of rows removed.
+    * ``shards`` - tuple of per-shard removal counts, in shard order.
+    * ``completed_shards`` - number of shards whose eviction completed.
+    * ``failed_shards`` - tuple of ``(index, count, error)`` triples for shards
+      that did not complete. ``count`` is the number removed before failure.
+    * ``atomic`` - ``True`` only when every shard was locked in a single
+      transaction (``transact=True``). When ``False`` each shard is removed in
+      its own transactions, so an item on shard A may be removed while an item
+      on shard B remains until its shard is processed.
+    * ``shard_atomic`` - ``True`` when each individual shard's removal is
+      atomic, which holds for the default per-shard execution.
+
+    """
+
+    __slots__ = ('total', 'shards', 'completed_shards', 'failed_shards',
+                 'atomic', 'shard_atomic')
+
+    def __init__(
+        self,
+        total,
+        shards,
+        atomic=False,
+        shard_atomic=True,
+        completed_shards=None,
+        failed_shards=(),
+    ):
+        self.total = total
+        self.shards = tuple(shards)
+        self.atomic = bool(atomic)
+        self.shard_atomic = bool(shard_atomic)
+        self.completed_shards = (
+            len(self.shards)
+            if completed_shards is None
+            else completed_shards
+        )
+        self.failed_shards = tuple(failed_shards)
+
+    def __int__(self):
+        return self.total
+
+    def __index__(self):
+        return self.total
+
+    def __eq__(self, other):
+        if isinstance(other, TagEvictResult):
+            return self.total == other.total
+        if isinstance(other, int):
+            return self.total == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __lt__(self, other):
+        return self.total < int(other)
+
+    def __le__(self, other):
+        return self.total <= int(other)
+
+    def __gt__(self, other):
+        return self.total > int(other)
+
+    def __ge__(self, other):
+        return self.total >= int(other)
+
+    def __hash__(self):
+        return hash(self.total)
+
+    def __repr__(self):
+        return (
+            'TagEvictResult(total=%d, shards=%r, completed_shards=%d,'
+            ' failed_shards=%r, atomic=%r, shard_atomic=%r)'
+            % (
+                self.total,
+                self.shards,
+                self.completed_shards,
+                self.failed_shards,
+                self.atomic,
+                self.shard_atomic,
+            )
+        )
+
+    __str__ = __repr__
+
+
+def _normalize_match(match):
+    """Return a canonical match mode for `match`."""
+    try:
+        return _MATCH_ALIASES[str(match).lower()]
+    except KeyError:
+        raise ValueError(
+            'match must be one of %s' % ', '.join(sorted(_MATCH_ALIASES))
+        ) from None
+
+
+def _normalize_tags(tags):
+    """Return a de-duplicated list of tag values.
+
+    ``None`` is ignored because it represents the absence of a tag. A scalar
+    tag is treated as a single-element collection so ``tags='source'`` and
+    ``tags=['source']`` are equivalent. Duplicates are removed using SQLite's
+    equality semantics for the supported tag types (integer, float, string and
+    bytes).
+
+    """
+    if tags is None:
+        return []
+
+    if isinstance(tags, (str, bytes, bytearray, int, float)):
+        items = [tags]
+    else:
+        try:
+            items = list(tags)
+        except TypeError:
+            items = [tags]
+
+    result = []
+    seen = set()
+
+    for tag in items:
+        if tag is None:
+            continue
+        if isinstance(tag, bytearray):
+            tag = bytes(tag)
+        try:
+            if tag in seen:
+                continue
+            seen.add(tag)
+        except TypeError:
+            # Unhashable tag values are not valid SQLite bindings but keep
+            # the equality check and let the database raise a useful error.
+            if tag in result:
+                continue
+        result.append(tag)
+
+    return result
+
+
+def _tag_values(tag, tags):
+    """Return the full list of tags for an item, including primary `tag`."""
+    values = []
+
+    if tag is not None:
+        values.append(tag)
+
+    if tags is not None:
+        values.extend(_normalize_tags(tags))
+
+    # Remove duplicates across tag and tags while preserving order.
+    result = []
+    seen = set()
+
+    for value in values:
+        if isinstance(value, bytearray):
+            value = bytes(value)
+        try:
+            if value in seen:
+                continue
+            seen.add(value)
+        except TypeError:
+            if value in result:
+                continue
+        result.append(value)
+
+    return result
+
+
 def args_to_key(base, args, kwargs, typed, ignore):
     """Create cache key out of function arguments.
 
@@ -538,6 +737,49 @@ class Cache:
 
         if query is not None:
             sql(query)
+
+        # Setup CacheTag multi-tag association table. The CacheTag rowid
+        # references Cache.rowid. An AFTER DELETE trigger on Cache keeps the
+        # association table consistent for every removal path (delete, pop,
+        # pull, expire, evict, cull, clear, and check --fix) so an association
+        # row can never outlive its value record.
+
+        sql(
+            'CREATE TABLE IF NOT EXISTS CacheTag ('
+            ' rowid INTEGER NOT NULL,'
+            ' tag BLOB NOT NULL,'
+            ' PRIMARY KEY (rowid, tag))'
+        )
+
+        sql(
+            'CREATE INDEX IF NOT EXISTS CacheTag_tag_rowid ON'
+            ' CacheTag (tag, rowid)'
+        )
+
+        sql(
+            'CREATE TRIGGER IF NOT EXISTS CacheTag_cache_delete'
+            ' AFTER DELETE ON Cache FOR EACH ROW BEGIN'
+            ' DELETE FROM CacheTag WHERE rowid = OLD.rowid; END'
+        )
+
+        # Upgrade caches created before the CacheTag table by indexing the
+        # existing Cache.tag column once. The tag_schema_version setting marks
+        # the migration so it is not repeated on every reopen.
+
+        rows = sql(
+            'SELECT value FROM Settings WHERE key = ?',
+            (TAG_SCHEMA_SETTING,),
+        ).fetchall()
+
+        if not rows or rows[0][0] != TAG_SCHEMA_VERSION:
+            sql(
+                'INSERT OR IGNORE INTO CacheTag (rowid, tag)'
+                ' SELECT rowid, tag FROM Cache WHERE tag IS NOT NULL'
+            )
+            sql(
+                'INSERT OR REPLACE INTO Settings VALUES (?, ?)',
+                (TAG_SCHEMA_SETTING, TAG_SCHEMA_VERSION),
+            )
 
         # Use triggers to keep Metadata updated.
 
@@ -746,7 +988,16 @@ class Cache:
                 if name is not None:
                     _disk_remove(name)
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
@@ -755,6 +1006,11 @@ class Cache:
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
 
+        The primary `tag` and any additional `tags` are associated with the
+        item in the CacheTag table. Use :meth:`Cache.query_tags` and
+        :meth:`Cache.evict_tags` to query or remove items by any or all of
+        their tags. Setting an existing key replaces its tag associations.
+
         :param key: key for item
         :param value: value for item
         :param float expire: seconds until item expires
@@ -762,6 +1018,7 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: additional tags to associate with key (default None)
         :return: True if item was set
         :raises Timeout: if database timeout occurs
 
@@ -771,6 +1028,7 @@ class Cache:
         expire_time = None if expire is None else now + expire
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
         columns = (expire_time, tag, size, mode, filename, db_value)
+        tag_values = _tag_values(tag, tags)
 
         # The order of SELECT, UPDATE, and INSERT is important below.
         #
@@ -803,9 +1061,9 @@ class Cache:
             if rows:
                 ((rowid, old_filename),) = rows
                 cleanup(old_filename)
-                self._row_update(rowid, now, columns)
+                self._row_update(rowid, now, columns, tag_values)
             else:
-                self._row_insert(db_key, raw, now, columns)
+                self._row_insert(db_key, raw, now, columns, tag_values)
 
             self._cull(now, sql, cleanup)
 
@@ -822,7 +1080,7 @@ class Cache:
         """
         self.set(key, value, retry=True)
 
-    def _row_update(self, rowid, now, columns):
+    def _row_update(self, rowid, now, columns, tags=()):
         sql = self._sql
         expire_time, tag, size, mode, filename, value = columns
         sql(
@@ -850,11 +1108,12 @@ class Cache:
                 rowid,
             ),
         )
+        self._replace_tags(rowid, tags)
 
-    def _row_insert(self, key, raw, now, columns):
+    def _row_insert(self, key, raw, now, columns, tags=()):
         sql = self._sql
         expire_time, tag, size, mode, filename, value = columns
-        sql(
+        cursor = sql(
             'INSERT INTO Cache('
             ' key, raw, store_time, expire_time, access_time,'
             ' access_count, tag, size, mode, filename, value'
@@ -873,6 +1132,21 @@ class Cache:
                 value,
             ),
         )
+        self._replace_tags(cursor.lastrowid, tags)
+
+    def _replace_tags(self, rowid, tags):
+        """Replace CacheTag associations for `rowid` within a transaction."""
+        sql = self._sql
+        sql('DELETE FROM CacheTag WHERE rowid = ?', (rowid,))
+        self._insert_tags(rowid, tags)
+
+    def _insert_tags(self, rowid, tags):
+        sql = self._sql
+        for tag in tags:
+            sql(
+                'INSERT OR IGNORE INTO CacheTag (rowid, tag) VALUES (?, ?)',
+                (rowid, tag),
+            )
 
     def _cull(self, now, sql, cleanup, limit=None):
         cull_limit = self.cull_limit if limit is None else limit
@@ -961,7 +1235,16 @@ class Cache:
 
         return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -982,6 +1265,7 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: additional tags to associate with key (default None)
         :return: True if item was added
         :raises Timeout: if database timeout occurs
 
@@ -991,6 +1275,7 @@ class Cache:
         expire_time = None if expire is None else now + expire
         size, mode, filename, db_value = self._disk.store(value, read, key=key)
         columns = (expire_time, tag, size, mode, filename, db_value)
+        tag_values = _tag_values(tag, tags)
 
         with self._transact(retry, filename) as (sql, cleanup):
             rows = sql(
@@ -1007,9 +1292,9 @@ class Cache:
                     return False
 
                 cleanup(old_filename)
-                self._row_update(rowid, now, columns)
+                self._row_update(rowid, now, columns, tag_values)
             else:
-                self._row_insert(db_key, raw, now, columns)
+                self._row_insert(db_key, raw, now, columns, tag_values)
 
             self._cull(now, sql, cleanup)
 
@@ -1393,6 +1678,7 @@ class Cache:
         read=False,
         tag=None,
         retry=False,
+        tags=None,
     ):
         """Push `value` onto `side` of queue identified by `prefix` in cache.
 
@@ -1432,6 +1718,7 @@ class Cache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: additional tags to associate with key (default None)
         :return: key for item in cache
         :raises Timeout: if database timeout occurs
 
@@ -1448,6 +1735,7 @@ class Cache:
         expire_time = None if expire is None else now + expire
         size, mode, filename, db_value = self._disk.store(value, read)
         columns = (expire_time, tag, size, mode, filename, db_value)
+        tag_values = _tag_values(tag, tags)
         order = {'back': 'DESC', 'front': 'ASC'}
         select = (
             'SELECT key FROM Cache'
@@ -1479,7 +1767,7 @@ class Cache:
             else:
                 db_key = num
 
-            self._row_insert(db_key, raw, now, columns)
+            self._row_insert(db_key, raw, now, columns, tag_values)
             self._cull(now, sql, cleanup)
 
             return db_key
@@ -2017,6 +2305,25 @@ class Cache:
                             (size, 'size'),
                         )
 
+                # Check CacheTag associations reference existing Cache rows.
+
+                select_orphan = (
+                    'SELECT t.rowid, t.tag FROM CacheTag AS t'
+                    ' LEFT JOIN Cache AS c ON c.rowid = t.rowid'
+                    ' WHERE c.rowid IS NULL'
+                )
+                orphan_rows = sql(select_orphan).fetchall()
+
+                for rowid, tag in orphan_rows:
+                    message = 'orphan tag association: %d, %r' % (rowid, tag)
+                    warnings.warn(message)
+
+                    if fix:
+                        sql(
+                            'DELETE FROM CacheTag WHERE rowid = ? AND tag = ?',
+                            (rowid, tag),
+                        )
+
             return warns
 
     def create_tag_index(self):
@@ -2044,7 +2351,14 @@ class Cache:
         sql('DROP INDEX IF EXISTS Cache_tag_rowid')
         self.reset('tag_index', 0)
 
-    def evict(self, tag, retry=False):
+    def evict(
+        self,
+        tag=None,
+        retry=False,
+        tags=None,
+        match=MATCH_ANY,
+        mode=None,
+    ):
         """Remove items with matching `tag` from cache.
 
         Removing items is an iterative process. In each iteration, a subset of
@@ -2054,22 +2368,236 @@ class Cache:
         `args` attribute will be the number of items removed before the
         exception occurred.
 
+        When `tags` is given, items are removed by multi-tag association
+        instead of the single legacy `tag` column. `match` controls whether an
+        item is removed when *any* tag matches (default, union) or when *all*
+        tags match (intersection). ``mode`` is accepted as an alias for
+        ``match``. This is a convenience wrapper around
+        :meth:`Cache.evict_tags`.
+
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
 
         :param str tag: tag identifying items
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: tags for multi-tag matching (default None)
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param str mode: alias for `match`
         :return: count of rows removed
         :raises Timeout: if database timeout occurs
 
         """
+        if mode is not None:
+            match = mode
+
+        if tags is not None:
+            return self.evict_tags(tags, match=match, retry=retry)
+
         select = (
             'SELECT rowid, filename FROM Cache'
             ' WHERE tag = ? AND rowid > ?'
             ' ORDER BY rowid LIMIT ?'
         )
-        args = [tag, 0, 100]
+        args = [tag, 0, _TAG_BATCH_SIZE]
         return self._select_delete(select, args, arg_index=1, retry=retry)
+
+    def _tag_select(self, tags, match, fields, use_expire, rowid_cursor):
+        """Build a select statement for multi-tag matching."""
+        placeholders = ','.join('?' for _ in tags)
+        conditions = []
+
+        if use_expire:
+            conditions.append('(expire_time IS NULL OR expire_time > ?)')
+
+        if rowid_cursor:
+            conditions.append('c.rowid > ?')
+
+        if match == MATCH_ALL:
+            conditions.append(
+                '(SELECT COUNT(DISTINCT t.tag) FROM CacheTag AS t'
+                ' WHERE t.rowid = c.rowid AND t.tag IN (%s)) = ?'
+                % placeholders
+            )
+        else:
+            assert match == MATCH_ANY
+            conditions.append(
+                'EXISTS (SELECT 1 FROM CacheTag AS t'
+                ' WHERE t.rowid = c.rowid AND t.tag IN (%s))'
+                % placeholders
+            )
+
+        select = 'SELECT %s FROM Cache AS c WHERE %s ORDER BY c.rowid' % (
+            fields,
+            ' AND '.join(conditions),
+        )
+        expected = len(tags) if match == MATCH_ALL else None
+        return select, expected
+
+    def query_tags(
+        self, tags, match=MATCH_ANY, limit=None, retry=False, mode=None
+    ):  # pylint: disable=unused-argument
+        """Return keys associated with matching tags.
+
+        Expired items are excluded from the result. Empty `tags` returns an
+        empty list in both match modes. Duplicate tags are ignored. Tags may be
+        integer, float, string or bytes, like the legacy `tag` values.
+
+        With ``match='any'`` (the default) an item is returned when at least
+        one requested tag is associated with it (union). With ``match='all'``
+        an item is returned only when every requested tag is associated with
+        it (intersection). ``mode`` is accepted as an alias for ``match``.
+
+        :param tags: iterable of tags or a single tag
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param int limit: maximum number of keys to return (default None)
+        :param bool retry: retry if database timeout occurs (default False)
+        :param str mode: alias for `match`
+        :return: list of cache keys
+        :raises Timeout: if database timeout occurs
+
+        """
+        if mode is not None:
+            match = mode
+
+        match = _normalize_match(match)
+        tags = _normalize_tags(tags)
+
+        if not tags:
+            return []
+
+        if limit is not None and limit < 0:
+            raise ValueError('limit must be non-negative')
+
+        if limit == 0:
+            return []
+
+        select, expected = self._tag_select(
+            tags, match, 'c.key, c.raw', use_expire=True, rowid_cursor=False
+        )
+        args = [time.time(), *tags]
+
+        if expected is not None:
+            args.append(expected)
+
+        if limit is not None:
+            select += ' LIMIT ?'
+            args.append(limit)
+
+        rows = self._sql(select, args).fetchall()
+        _disk_get = self._disk.get
+        return [_disk_get(key, raw) for key, raw in rows]
+
+    # Common aliases for the multi-tag query API.
+    find_by_tags = query_tags
+    select_tags = query_tags
+    match_tags = query_tags
+
+    def get_tags(
+        self, key, default=None, retry=False
+    ):  # pylint: disable=unused-argument
+        """Return the list of tags associated with `key`.
+
+        The primary `tag` column is included first, followed by the additional
+        tags in sorted order. Missing or expired keys return `default`.
+
+        :param key: key for item
+        :param default: value to return if key is missing (default None)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: list of tags or `default`
+        :raises Timeout: if database timeout occurs
+
+        """
+        db_key, raw = self._disk.put(key)
+        select = (
+            'SELECT c.rowid, c.tag, c.expire_time FROM Cache AS c'
+            ' WHERE c.key = ? AND c.raw = ?'
+        )
+
+        rows = self._sql(select, (db_key, raw)).fetchall()
+
+        if not rows:
+            return default
+
+        ((rowid, db_tag, expire_time),) = rows
+
+        if expire_time is not None and expire_time <= time.time():
+            return default
+
+        tags = [] if db_tag is None else [db_tag]
+
+        if db_tag is None:
+            rows = self._sql(
+                'SELECT tag FROM CacheTag WHERE rowid = ? ORDER BY tag',
+                (rowid,),
+            ).fetchall()
+        else:
+            rows = self._sql(
+                'SELECT tag FROM CacheTag WHERE rowid = ? AND tag IS NOT ?'
+                ' ORDER BY tag',
+                (rowid, db_tag),
+            ).fetchall()
+
+        for (tag,) in rows:
+            if tag not in tags:
+                tags.append(tag)
+
+        return tags
+
+    def evict_tags(self, tags, match=MATCH_ANY, retry=False, mode=None):
+        """Remove items whose tags match `tags`.
+
+        ``match='any'`` removes items associated with at least one requested
+        tag (union). ``match='all'`` removes only items associated with every
+        requested tag (intersection). Empty `tags` removes nothing. Expired
+        items are included because the association itself is being
+        invalidated. ``mode`` is accepted as an alias for ``match``.
+
+        Removing items is an iterative process. In each iteration, a subset of
+        items is removed. Concurrent writes may occur between iterations.
+
+        If a :exc:`Timeout` occurs, the first element of the exception's
+        `args` attribute will be the number of items removed before the
+        exception occurred.
+
+        :param tags: iterable of tags or a single tag
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param bool retry: retry if database timeout occurs (default False)
+        :param str mode: alias for `match`
+        :return: count of rows removed
+        :raises Timeout: if database timeout occurs
+
+        """
+        if mode is not None:
+            match = mode
+
+        match = _normalize_match(match)
+        tags = _normalize_tags(tags)
+
+        if not tags:
+            return 0
+
+        select, expected = self._tag_select(
+            tags,
+            match,
+            'c.rowid, c.filename',
+            use_expire=False,
+            rowid_cursor=True,
+        )
+        args = [0, *tags]
+
+        if expected is not None:
+            args.append(expected)
+
+        select += ' LIMIT ?'
+        args.append(_TAG_BATCH_SIZE)
+
+        return self._select_delete(
+            select, args, row_index=0, arg_index=0, retry=retry
+        )
+
+    # Common aliases for the multi-tag deletion API.
+    delete_tags = evict_tags
+    evict_by_tags = evict_tags
 
     def expire(self, now=None, retry=False):
         """Remove expired items from cache.

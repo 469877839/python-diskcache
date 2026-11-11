@@ -72,6 +72,7 @@ class DjangoCache(BaseCache):
         read=False,
         tag=None,
         retry=True,
+        tags=None,
     ):
         """Set a value in the cache if the key does not already exist. If
         timeout is given, that timeout will be used for the key; otherwise the
@@ -87,13 +88,14 @@ class DjangoCache(BaseCache):
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default True)
+        :param tags: additional tags to associate with key (default None)
         :return: True if item was added
 
         """
         # pylint: disable=arguments-differ
         key = self.make_key(key, version=version)
         timeout = self.get_backend_timeout(timeout=timeout)
-        return self._cache.add(key, value, timeout, read, tag, retry)
+        return self._cache.add(key, value, timeout, read, tag, retry, tags)
 
     def get(
         self,
@@ -145,6 +147,7 @@ class DjangoCache(BaseCache):
         read=False,
         tag=None,
         retry=True,
+        tags=None,
     ):
         """Set a value in the cache. If timeout is given, that timeout will be
         used for the key; otherwise the default cache timeout will be used.
@@ -157,13 +160,14 @@ class DjangoCache(BaseCache):
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default True)
+        :param tags: additional tags to associate with key (default None)
         :return: True if item was set
 
         """
         # pylint: disable=arguments-differ
         key = self.make_key(key, version=version)
         timeout = self.get_backend_timeout(timeout=timeout)
-        return self._cache.set(key, value, timeout, read, tag, retry)
+        return self._cache.set(key, value, timeout, read, tag, retry, tags)
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None, retry=True):
         """Touch a key in the cache. If timeout is given, that timeout will be
@@ -327,14 +331,22 @@ class DjangoCache(BaseCache):
         """
         self._cache.drop_tag_index()
 
-    def evict(self, tag):
+    def evict(self, tag=None, tags=None, match='any', mode=None):
         """Remove items with matching `tag` from cache.
 
+        When `tags` is given, items are removed by multi-tag association
+        instead of the single legacy `tag` column.
+
         :param str tag: tag identifying items
+        :param tags: tags for multi-tag matching (default None)
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param str mode: alias for `match`
         :return: count of items removed
 
         """
-        return self._cache.evict(tag)
+        if mode is not None:
+            match = mode
+        return self._cache.evict(tag, tags=tags, match=match)
 
     def cull(self):
         """Cull items from cache until volume is less than size limit.

@@ -23,6 +23,12 @@ Read the :ref:`FanoutCache tutorial <tutorial-fanoutcache>` for example usage.
    :special-members:
    :exclude-members: __weakref__
 
+TagEvictResult
+--------------
+
+.. autoclass:: diskcache.TagEvictResult
+   :members:
+
 DjangoCache
 -----------
 

@@ -9,7 +9,15 @@ import sqlite3
 import tempfile
 import time
 
-from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
+from .core import (
+    DEFAULT_SETTINGS,
+    ENOVAL,
+    MATCH_ANY,
+    Cache,
+    Disk,
+    TagEvictResult,
+    Timeout,
+)
 from .persistent import Deque, Index
 
 
@@ -99,7 +107,16 @@ class FanoutCache:
                 stack.enter_context(shard_transaction)
             yield
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
@@ -115,13 +132,14 @@ class FanoutCache:
         :param bool read: read value as raw bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: additional tags to associate with key (default None)
         :return: True if item was set
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.set(key, value, expire, read, tag, retry)
+            return shard.set(key, value, expire, read, tag, retry, tags)
         except Timeout:
             return False
 
@@ -158,7 +176,16 @@ class FanoutCache:
         except Timeout:
             return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self,
+        key,
+        value,
+        expire=None,
+        read=False,
+        tag=None,
+        retry=False,
+        tags=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -179,13 +206,14 @@ class FanoutCache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: additional tags to associate with key (default None)
         :return: True if item was added
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.add(key, value, expire, read, tag, retry)
+            return shard.add(key, value, expire, read, tag, retry, tags)
         except Timeout:
             return False
 
@@ -440,18 +468,191 @@ class FanoutCache:
         for shard in self._shards:
             shard.drop_tag_index()
 
-    def evict(self, tag, retry=False):
+    def evict(
+        self,
+        tag=None,
+        retry=False,
+        tags=None,
+        match=MATCH_ANY,
+        mode=None,
+    ):
         """Remove items with matching `tag` from cache.
+
+        When `tags` is given, items are removed by multi-tag association
+        instead of the single legacy `tag` column. See
+        :meth:`FanoutCache.evict_tags` for details.
 
         If database timeout occurs then fails silently unless `retry` is set to
         `True` (default `False`).
 
         :param str tag: tag identifying items
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: tags for multi-tag matching (default None)
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param str mode: alias for `match`
         :return: count of items removed
 
         """
+        if mode is not None:
+            match = mode
+
+        if tags is not None:
+            return self.evict_tags(tags, match=match, retry=retry)
         return self._remove('evict', args=(tag,), retry=retry)
+
+    def get_tags(self, key, default=None, retry=False):
+        """Return the list of tags associated with `key`.
+
+        The primary `tag` column is included first, followed by the additional
+        tags in sorted order. Missing or expired keys return `default`.
+
+        :param key: key for item
+        :param default: value to return if key is missing (default None)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: list of tags or `default`
+
+        """
+        index = self._hash(key) % self._count
+        shard = self._shards[index]
+        try:
+            return shard.get_tags(key, default=default, retry=retry)
+        except Timeout:
+            return default
+
+    def query_tags(
+        self, tags, match=MATCH_ANY, limit=None, retry=False, mode=None
+    ):
+        """Return keys associated with matching tags across all shards.
+
+        Expired items are excluded from the result. Empty `tags` returns an
+        empty list in both match modes. Duplicate tags are ignored.
+
+        With ``match='any'`` (the default) an item is returned when at least
+        one requested tag is associated with it (union). With ``match='all'``
+        an item is returned only when every requested tag is associated with
+        it (intersection). ``mode`` is accepted as an alias for ``match``.
+
+        Each shard is queried independently, so results are not a consistent
+        snapshot across shards; use :meth:`FanoutCache.transact` to query
+        while holding all shard locks.
+
+        :param tags: iterable of tags or a single tag
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param int limit: maximum number of keys to return (default None)
+        :param bool retry: retry if database timeout occurs (default False)
+        :param str mode: alias for `match`
+        :return: list of cache keys
+
+        """
+        if limit is not None and limit < 0:
+            raise ValueError('limit must be non-negative')
+
+        if limit == 0:
+            return []
+
+        keys = []
+
+        for shard in self._shards:
+            try:
+                shard_keys = shard.query_tags(
+                    tags, match=match, limit=limit, retry=retry, mode=mode
+                )
+            except Timeout:
+                if retry:
+                    raise
+                continue
+            keys.extend(shard_keys)
+
+            if limit is not None and len(keys) >= limit:
+                keys = keys[:limit]
+                break
+
+        return keys
+
+    # Common aliases for the multi-tag query API.
+    find_by_tags = query_tags
+    select_tags = query_tags
+    match_tags = query_tags
+
+    def evict_tags(
+        self,
+        tags,
+        match=MATCH_ANY,
+        retry=False,
+        mode=None,
+        transact=False,
+    ):
+        """Remove items whose tags match `tags` across all shards.
+
+        ``match='any'`` removes items associated with at least one requested
+        tag (union). ``match='all'`` removes only items associated with every
+        requested tag (intersection). Empty `tags` removes nothing. Expired
+        items are included because the association itself is being
+        invalidated. ``mode`` is accepted as an alias for ``match``.
+
+        Atomic boundary: by default each shard is evicted in its own
+        transactions, so the operation is atomic per shard but not across
+        shards. Set ``transact=True`` to hold every shard's transaction lock
+        for the duration of the eviction, making the whole operation atomic
+        across shards at the cost of blocking other writers.
+
+        The returned :class:`TagEvictResult` compares equal to its integer
+        total and additionally reports the per-shard counts, the number of
+        completed and failed shards, and the atomic boundary flags.
+
+        :param tags: iterable of tags or a single tag
+        :param str match: 'any' (union) or 'all' (intersection)
+        :param bool retry: retry if database timeout occurs (default False)
+        :param str mode: alias for `match`
+        :param bool transact: hold all shard locks for a cross-shard atomic
+            eviction (default False)
+        :return: TagEvictResult with per-shard counts and atomic boundaries
+
+        """
+        if mode is not None:
+            match = mode
+
+        if transact:
+            with self.transact(retry=True):
+                counts = [
+                    shard.evict_tags(tags, match=match, retry=True)
+                    for shard in self._shards
+                ]
+            return TagEvictResult(
+                total=sum(counts),
+                shards=counts,
+                atomic=True,
+                shard_atomic=True,
+                completed_shards=len(counts),
+            )
+
+        counts = []
+        failed = []
+        total = 0
+
+        for index, shard in enumerate(self._shards):
+            count = 0
+            try:
+                count = shard.evict_tags(tags, match=match, retry=retry)
+            except Timeout as timeout:
+                if timeout.args and isinstance(timeout.args[0], int):
+                    count = timeout.args[0]
+                failed.append((index, count, timeout))
+            counts.append(count)
+            total += count
+
+        return TagEvictResult(
+            total=total,
+            shards=counts,
+            atomic=False,
+            shard_atomic=True,
+            completed_shards=len(self._shards) - len(failed),
+            failed_shards=failed,
+        )
+
+    # Common aliases for the multi-tag deletion API.
+    delete_tags = evict_tags
+    evict_by_tags = evict_tags
 
     def cull(self, retry=False):
         """Cull items from cache until volume is less than size limit.

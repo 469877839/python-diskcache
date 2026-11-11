@@ -77,6 +77,7 @@ Features
 - Thread-safe and process-safe
 - Supports multiple eviction policies (LRU and LFU included)
 - Keys support "tag" metadata and eviction
+- Keys support multiple tags with any/all union and intersection queries
 - Developed on Python 3.10
 - Tested on CPython 3.6, 3.7, 3.8, 3.9, 3.10
 - Tested on Linux, Mac OS X, and Windows

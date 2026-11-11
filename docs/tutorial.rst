@@ -259,6 +259,46 @@ Likewise, the tag index may be created or dropped using methods::
 But prefer initializing the cache with a tag index rather than explicitly
 creating or dropping the tag index.
 
+.. _tutorial-multi-tags:
+
+A single item may also be associated with multiple tags, for example a
+source, a batch, and a schema version. Pass ``tags`` to :meth:`set
+<diskcache.Cache.set>` and query or evict by matching *any* tag (union) or
+*all* tags (intersection) with :meth:`query_tags
+<diskcache.Cache.query_tags>` and :meth:`evict_tags
+<diskcache.Cache.evict_tags>`.
+
+    >>> cache.set('k1', 1, tags=['source-a', 'batch-1', 'schema-v2'])
+    True
+    >>> cache.set('k2', 2, tags=['source-a', 'batch-2'])
+    True
+    >>> cache.query_tags(['source-a'])  # Union: any tag matches.
+    ['k1', 'k2']
+    >>> cache.query_tags(['source-a', 'batch-1'], match='all')
+    ['k1']
+    >>> cache.get_tags('k1')
+    ['batch-1', 'schema-v2', 'source-a']
+    >>> cache.evict_tags(['batch-2'])  # Removes 'k2'.
+    1
+    >>> cache.evict_tags(['source-a', 'schema-v2'], match='all')
+    1
+
+The primary ``tag`` column is always included in the tag association, so
+items stored by older versions remain visible to multi-tag queries after
+upgrading. Empty tag collections match nothing and duplicate tags are
+ignored. Expired items are excluded from :meth:`query_tags
+<diskcache.Cache.query_tags>` but are still removed by :meth:`evict_tags
+<diskcache.Cache.evict_tags>` because the association itself is being
+invalidated.
+
+For :class:`FanoutCache`, :meth:`evict_tags
+<diskcache.FanoutCache.evict_tags>` returns a
+:class:`diskcache.TagEvictResult` which compares equal to its integer total
+and additionally reports the per-shard counts and atomic boundary of the
+operation. By default each shard is evicted in its own transactions so the
+operation is atomic per shard but not across shards. Pass ``transact=True``
+to hold every shard's lock and make the eviction atomic across shards.
+
 To manually enforce the cache's size limit, use the :meth:`cull
 <diskcache.Cache.cull>` method. :meth:`Cull <diskcache.Cache.cull>` begins by
 removing expired items from the cache and then uses the eviction policy to
