@@ -709,6 +709,11 @@ during initialization when passed as keyword arguments.
   <diskcache.Cache.evict>`.
 * `eviction_policy`, default "least-recently-stored". The setting to determine
   :ref:`eviction policy <tutorial-eviction-policies>`.
+* `access_log_limit`, default zero, disabled. When set to a positive integer
+  with the ``"least-recently-used"`` eviction policy, cache hits are buffered
+  in memory and written to the database in batches instead of writing on every
+  hit. See :ref:`batched access recording
+  <tutorial-batched-access-recording>` for the trade-offs and guarantees.
 
 The :meth:`reset <diskcache.FanoutCache.reset>` method accepts an optional
 second argument that updates the corresponding value in the database. The
@@ -802,6 +807,69 @@ policy. The policy can be set during initialization using a keyword argument.
 Though the eviction policy is changed, the previously created indexes will not
 be dropped. Prefer to always specify the eviction policy as a keyword argument
 to initialize the cache.
+
+.. _tutorial-batched-access-recording:
+
+Batched Access Recording
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+With the default ``"least-recently-used"`` behavior, every cache hit executes
+``UPDATE Cache SET access_time = ...``. Read-heavy workloads therefore take a
+write lock on each hit, which serializes readers across threads and
+processes. Setting ``access_log_limit`` to a positive integer buffers hits in
+memory inside the process and flushes them in a single transaction:
+
+    >>> cache = Cache(
+    ...     eviction_policy='least-recently-used', access_log_limit=1000
+    ... )
+    >>> cache.get('key')
+    >>> _ = cache.flush_access_log()  # Optional; also happens automatically.
+
+The value of ``access_log_limit`` is the maximum number of *distinct* keys
+with buffered hits per process. Repeated access to the same key collapses into
+one record carrying its most recent access time, so the buffer never grows
+beyond the number of distinct keys. The mode has no effect on other eviction
+policies and a limit of zero (the default) keeps the exact, immediate
+update. No background thread or service is required.
+
+A flush is triggered when:
+
+* the buffer reaches ``access_log_limit`` distinct keys, inline on the next
+  hit;
+* :meth:`flush_access_log <diskcache.Cache.flush_access_log>` is called;
+* the cache is closed normally, including exiting a ``with`` block;
+* a write operation such as ``set``, ``delete``, ``pop``, ``clear``,
+  ``evict``, or ``expire`` makes the pending records unsafe to keep.
+
+Because records are buffered per process and written lazily,
+``access_time`` values in the database lag the true access time. The maximum
+visible delay is unbounded in wall-clock time: it is bounded instead by
+``access_log_limit`` distinct-key hits between flushes, or by the next
+explicit flush or graceful close. If deterministic visibility is needed,
+call :meth:`flush_access_log <diskcache.Cache.flush_access_log>` at the point
+where it matters.
+
+Differences from exact LRU:
+
+* Exact LRU writes once per hit, so ``access_time`` is always current and
+  eviction order is exact. Batched mode writes at most once per distinct key
+  per flush, and eviction uses the last flushed time. Two keys whose hits sit
+  in different buffers may therefore be ordered by their previous flush
+  times; the ordering of hits within the same buffer is exact because each
+  record keeps the most recent time.
+* The flush reconciles with the current database state. A stale record never
+  moves an ``access_time`` backwards: records only update rows whose stored
+  time is older than the buffered time. A key that was deleted, expired, or
+  replaced after its access was buffered is silently skipped, so a flush
+  never recreates a deleted row or overwrites a replacement's own access
+  time.
+* Buffered records live in process memory. A graceful close flushes them. A
+  process that crashes or is killed without closing loses the records that
+  were not yet flushed; the affected keys remain usable with their previous
+  access times. Other processes are unaffected because they keep their own
+  buffers and only ever read flushed values from the database.
+* Reopening a cache with ``access_log_limit=0`` (or switching the limit at
+  runtime) flushes the buffer first, so no records are stranded.
 
 .. _tutorial-disk:
 

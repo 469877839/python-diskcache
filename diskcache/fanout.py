@@ -512,6 +512,20 @@ class FanoutCache:
         """
         return sum(shard.volume() for shard in self._shards)
 
+    def flush_access_log(self, retry=False):
+        """Flush buffered access records in every shard.
+
+        See :meth:`Cache.flush_access_log` for semantics.
+
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: total number of access records applied across shards
+        :raises Timeout: if database timeout occurs
+
+        """
+        return sum(
+            shard.flush_access_log(retry=retry) for shard in self._shards
+        )
+
     def close(self):
         """Close database connection."""
         for shard in self._shards:

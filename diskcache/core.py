@@ -58,6 +58,10 @@ DEFAULT_SETTINGS = {
     'sqlite_synchronous': 1,  # NORMAL
     'disk_min_file_size': 2**15,  # 32kb
     'disk_pickle_protocol': pickle.HIGHEST_PROTOCOL,
+    # Zero keeps exact "least-recently-used" semantics: every hit updates
+    # access_time immediately. A positive value buffers that many access
+    # records per process before flushing them in one transaction.
+    'access_log_limit': 0,
 }
 
 METADATA = {
@@ -441,6 +445,10 @@ class Cache:
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
         self._txn_id = None
+        # Pending access records for batched "least-recently-used" updates.
+        # Maps database rowid to the most recent access time. Records are
+        # buffered per process and flushed by flush_access_log.
+        self._access_log = {}
 
         if not op.isdir(directory):
             try:
@@ -850,11 +858,15 @@ class Cache:
                 rowid,
             ),
         )
+        # The replacement row carries a fresh, authoritative access time.
+        # Any buffered record for the same row would otherwise try to move
+        # that time backwards.
+        self._access_log.pop(rowid, None)
 
     def _row_insert(self, key, raw, now, columns):
         sql = self._sql
         expire_time, tag, size, mode, filename, value = columns
-        sql(
+        cursor = sql(
             'INSERT INTO Cache('
             ' key, raw, store_time, expire_time, access_time,'
             ' access_count, tag, size, mode, filename, value'
@@ -873,6 +885,10 @@ class Cache:
                 value,
             ),
         )
+        # SQLite may reuse a rowid freed by a delete performed elsewhere.
+        # Drop any stale buffered access for the reused rowid so the new
+        # row keeps its own access time.
+        self._access_log.pop(cursor.lastrowid, None)
 
     def _cull(self, now, sql, cleanup, limit=None):
         cull_limit = self.cull_limit if limit is None else limit
@@ -888,7 +904,7 @@ class Cache:
             ' ORDER BY expire_time LIMIT ?'
         )
 
-        select_expired = select_expired_template % 'filename'
+        select_expired = select_expired_template % 'rowid, filename'
         rows = sql(select_expired, (now, cull_limit)).fetchall()
 
         if rows:
@@ -897,7 +913,8 @@ class Cache:
             )
             sql(delete_expired, (now, cull_limit))
 
-            for (filename,) in rows:
+            for expired_rowid, filename in rows:
+                self._access_log.pop(expired_rowid, None)
                 cleanup(filename)
 
             cull_limit -= len(rows)
@@ -912,7 +929,9 @@ class Cache:
         if select_policy is None or self.volume() < self.size_limit:
             return
 
-        select_filename = select_policy.format(fields='filename', now=now)
+        select_filename = select_policy.format(
+            fields='rowid, filename', now=now
+        )
         rows = sql(select_filename, (cull_limit,)).fetchall()
 
         if rows:
@@ -921,7 +940,8 @@ class Cache:
             )
             sql(delete, (cull_limit,))
 
-            for (filename,) in rows:
+            for culled_rowid, filename in rows:
+                self._access_log.pop(culled_rowid, None)
                 cleanup(filename)
 
     def touch(self, key, expire=None, retry=False):
@@ -1082,7 +1102,11 @@ class Cache:
             columns = 'store_time = ?, value = ?'
             update_column = EVICTION_POLICY[self.eviction_policy]['get']
 
-            if update_column is not None:
+            if update_column is not None and self._access_batched():
+                # Defer the access record; the store_time and value updates
+                # above are written immediately as before.
+                self._record_access(rowid, now)
+            elif update_column is not None:
                 columns += ', ' + update_column.format(now=now)
 
             update = 'UPDATE Cache SET %s WHERE rowid = ?' % columns
@@ -1119,6 +1143,69 @@ class Cache:
 
         """
         return self.incr(key, -delta, default, retry)
+
+    def _access_batched(self):
+        # Only "least-recently-used" uses an access-time column. Other
+        # policies must keep their exact, immediate update behavior.
+        return (
+            self.eviction_policy == 'least-recently-used'
+            and self.access_log_limit > 0
+        )
+
+    def _record_access(self, rowid, now):
+        # Buffer the hit. Repeated hits on one row collapse into a single
+        # record carrying the most recent time so the pending map never
+        # grows beyond the number of distinct keys.
+        log = self._access_log
+        previous = log.get(rowid)
+
+        if previous is None or now > previous:
+            log[rowid] = now
+
+        if len(log) >= self.access_log_limit:
+            self.flush_access_log()
+
+    def flush_access_log(self, retry=False):
+        """Flush buffered access records into the database.
+
+        Does nothing unless the eviction policy is
+        ``"least-recently-used"`` and ``access_log_limit`` is positive.
+        Each buffered row is updated with the most recent recorded access
+        time inside a single transaction, replacing one write per cache hit
+        with at most one write per distinct key per flush.
+
+        Records are reconciled with the current database state so they can
+        never move an ``access_time`` backwards and can never recreate a row
+        that was deleted or replaced after the access was recorded.
+
+        The flush is safe to call from another process: buffered records
+        belong to this process only and stale records are dropped silently.
+
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: number of access records applied to the database
+        :raises Timeout: if database timeout occurs
+
+        """
+        if not self._access_log:
+            return 0
+
+        log = self._access_log
+        # Detach the pending records before locking. Accesses arriving while
+        # the flush is in flight start a fresh buffer and go to the next
+        # flush, so the transaction stays short.
+        self._access_log = {}
+        applied = 0
+
+        with self._transact(retry) as (sql, _):
+            for rowid, access_time in log.items():
+                cursor = sql(
+                    'UPDATE Cache SET access_time = ?'
+                    ' WHERE rowid = ? AND access_time < ?',
+                    (access_time, rowid, access_time),
+                )
+                applied += cursor.rowcount
+
+        return applied
 
     def get(
         self,
@@ -1159,8 +1246,11 @@ class Cache:
         elif expire_time or tag:
             default = (default, None)
 
-        if not self.statistics and update_column is None:
-            # Fast path, no transaction necessary.
+        if not self.statistics and (
+            update_column is None or self._access_batched()
+        ):
+            # Fast path, no transaction necessary. In batched mode the hit
+            # is recorded in memory instead of taking the writer lock here.
 
             rows = self._sql(select, (db_key, raw, time.time())).fetchall()
 
@@ -1174,6 +1264,9 @@ class Cache:
             except IOError:
                 # Key was deleted before we could retrieve result.
                 return default
+
+            if update_column is not None:
+                self._record_access(rowid, time.time())
 
         else:  # Slow path, transaction required.
             cache_hit = (
@@ -1206,11 +1299,17 @@ class Cache:
                 if self.statistics:
                     sql(cache_hit)
 
-                now = time.time()
-                update = 'UPDATE Cache SET %s WHERE rowid = ?'
-
                 if update_column is not None:
-                    sql(update % update_column.format(now=now), (rowid,))
+                    now = time.time()
+
+                    if self._access_batched():
+                        # Defer the write. The rowid is buffered and the
+                        # flush reconciles deletes, replacements and newer
+                        # access times from other writers.
+                        self._record_access(rowid, now)
+                    else:
+                        update = 'UPDATE Cache SET %s WHERE rowid = ?'
+                        sql(update % update_column.format(now=now), (rowid,))
 
         if expire_time and tag:
             return (value, db_expire_time, db_tag)
@@ -1313,6 +1412,11 @@ class Cache:
 
             ((rowid, db_expire_time, db_tag, mode, filename, db_value),) = rows
 
+            # Preserve buffered accesses for other keys before deleting.
+            # A pending record for this row is dropped below.
+            self.flush_access_log()
+            self._access_log.pop(rowid, None)
+
             sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
 
         try:
@@ -1359,6 +1463,10 @@ class Cache:
                 raise KeyError(key)
 
             ((rowid, filename),) = rows
+            # Preserve buffered accesses for other keys before deleting.
+            # A pending record for this row is dropped below.
+            self.flush_access_log()
+            self._access_log.pop(rowid, None)
             sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
             cleanup(filename)
 
@@ -1959,6 +2067,7 @@ class Cache:
 
                     if fix:
                         sql('DELETE FROM Cache WHERE rowid = ?', (rowid,))
+                        self._access_log.pop(rowid, None)
 
                 # Check file system against Cache.filename.
 
@@ -2063,6 +2172,8 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
+        # Preserve buffered accesses for surviving keys before deleting.
+        self.flush_access_log()
         select = (
             'SELECT rowid, filename FROM Cache'
             ' WHERE tag = ? AND rowid > ?'
@@ -2090,6 +2201,8 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
+        # Preserve buffered accesses for surviving keys before deleting.
+        self.flush_access_log()
         select = (
             'SELECT rowid, expire_time, filename FROM Cache'
             ' WHERE ? < expire_time AND expire_time < ?'
@@ -2129,7 +2242,9 @@ class Cache:
         if select_policy is None:
             return 0
 
-        select_filename = select_policy.format(fields='filename', now=now)
+        select_filename = select_policy.format(
+            fields='rowid, filename', now=now
+        )
 
         try:
             while self.volume() > self.size_limit:
@@ -2146,7 +2261,8 @@ class Cache:
                     )
                     sql(delete, (10,))
 
-                    for (filename,) in rows:
+                    for culled_rowid, filename in rows:
+                        self._access_log.pop(culled_rowid, None)
                         cleanup(filename)
         except Timeout:
             raise Timeout(count) from None
@@ -2171,6 +2287,9 @@ class Cache:
         :raises Timeout: if database timeout occurs
 
         """
+        # Every row is removed, so every buffered record is stale. Discard
+        # them rather than writing access times that are deleted immediately.
+        self._access_log.clear()
         select = (
             'SELECT rowid, filename FROM Cache'
             ' WHERE rowid > ?'
@@ -2338,12 +2457,20 @@ class Cache:
         return total_size
 
     def close(self):
-        """Close database connection."""
+        """Close database connection.
+
+        Buffered access records (when ``access_log_limit`` is positive) are
+        flushed before the connection is closed. Records still in memory when
+        a process is killed without calling ``close`` are lost; their keys
+        remain usable but keep the access time of the previous flush.
+
+        """
         con = getattr(self._local, 'con', None)
 
         if con is None:
             return
 
+        self.flush_access_log(retry=True)
         con.close()
 
         try:
@@ -2407,9 +2534,19 @@ class Cache:
             setattr(self, key, value)
             return value
 
+        if key == 'access_log_limit':
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    'access_log_limit must be a non-negative integer'
+                )
+
         if update:
             statement = 'UPDATE Settings SET value = ? WHERE key = ?'
             sql_retry(statement, (value, key))
+
+        if key == 'access_log_limit':
+            # Switching limits must not strand buffered records.
+            self.flush_access_log(retry=True)
 
         if key.startswith('sqlite_'):
             pragma = key[7:]
