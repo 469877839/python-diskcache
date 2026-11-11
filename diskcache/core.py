@@ -19,6 +19,54 @@ import time
 import warnings
 import zlib
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None
+
+# Whether the platform offers an inter-process advisory lock. On such
+# platforms check() can prove an unknown file is abandoned; elsewhere it
+# has to treat unknown files as potentially in use.
+LOCK_SUPPORTED = fcntl is not None or msvcrt is not None
+
+
+def _try_lock(handle):
+    """Attempt to acquire an exclusive, non-blocking lock on `handle`.
+
+    The lock is released automatically by the operating system when the
+    file handle is closed or the process exits. Returns True when the
+    lock was acquired and False when another process holds it.
+
+    """
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+    if msvcrt is not None:  # pragma: no cover
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def _unlock(handle):
+    """Release a lock acquired by `_try_lock`."""
+    if fcntl is not None:
+        with cl.suppress(OSError):
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    elif msvcrt is not None:  # pragma: no cover
+        with cl.suppress(OSError):
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
 
 def full_name(func):
     """Return full name of `func` by adding the module and function name."""
@@ -36,6 +84,7 @@ class Constant(tuple):
 
 
 DBNAME = 'cache.db'
+TEMP_SUFFIX = '.tmp'
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
 
@@ -186,6 +235,23 @@ class Disk:
         :return: (size, mode, filename, value) tuple for Cache table
 
         """
+        size, mode, filename, db_value, writer = self._store(
+            value, read, key=key
+        )
+        if writer is not None:
+            writer.close()
+        return size, mode, filename, db_value
+
+    def _store(self, value, read, key=UNKNOWN):
+        """Like :meth:`store` but returns an additional open file handle.
+
+        For file-backed values, the extra handle holds an advisory lock on
+        the value file until the caller closes it. Cache keeps the lock
+        held until the database row is published so Cache.check can tell
+        files still in the publish window apart from orphaned files.
+        In-memory values return ``None`` for the handle.
+
+        """
         # pylint: disable=unidiomatic-typecheck
         type_value = type(value)
         min_file_size = self.min_file_size
@@ -198,37 +264,60 @@ class Disk:
             )
             or (type_value is float)
         ):
-            return 0, MODE_RAW, None, value
+            return 0, MODE_RAW, None, value, None
         elif type_value is bytes:
             if len(value) < min_file_size:
-                return 0, MODE_RAW, None, sqlite3.Binary(value)
+                return 0, MODE_RAW, None, sqlite3.Binary(value), None
             else:
                 filename, full_path = self.filename(key, value)
-                self._write(full_path, io.BytesIO(value), 'xb')
-                return len(value), MODE_BINARY, filename, None
+                size, writer = self._write(full_path, io.BytesIO(value), 'xb')
+                return size, MODE_BINARY, filename, None, writer
         elif type_value is str:
             filename, full_path = self.filename(key, value)
-            self._write(full_path, io.StringIO(value), 'x', 'UTF-8')
-            size = op.getsize(full_path)
-            return size, MODE_TEXT, filename, None
+            size, writer = self._write(
+                full_path, io.StringIO(value), 'x', 'UTF-8'
+            )
+            real_size = op.getsize(full_path)
+            assert size == real_size
+            return real_size, MODE_TEXT, filename, None, writer
         elif read:
             reader = ft.partial(value.read, 2**22)
             filename, full_path = self.filename(key, value)
             iterator = iter(reader, b'')
-            size = self._write(full_path, iterator, 'xb')
-            return size, MODE_BINARY, filename, None
+            size, writer = self._write(full_path, iterator, 'xb')
+            return size, MODE_BINARY, filename, None, writer
         else:
             result = pickle.dumps(value, protocol=self.pickle_protocol)
 
             if len(result) < min_file_size:
-                return 0, MODE_PICKLE, None, sqlite3.Binary(result)
+                return 0, MODE_PICKLE, None, sqlite3.Binary(result), None
             else:
                 filename, full_path = self.filename(key, value)
-                self._write(full_path, io.BytesIO(result), 'xb')
-                return len(result), MODE_PICKLE, filename, None
+                size, writer = self._write(
+                    full_path, io.BytesIO(result), 'xb'
+                )
+                return size, MODE_PICKLE, filename, None, writer
 
     def _write(self, full_path, iterator, mode, encoding=None):
+        """Write a value file and return ``(size, writer)``.
+
+        The contents are first written to a temporary path while holding an
+        advisory lock and then atomically renamed to `full_path`. The
+        returned open file handle keeps the lock alive; the caller is
+        responsible for closing it once the corresponding database row has
+        been published (or for closing it on failure to release the
+        unfinished file).
+
+        """
         full_dir, _ = op.split(full_path)
+        # POSIX keeps the final name hidden until publishing via an atomic
+        # rename of the open, locked temp file. Windows cannot rename an
+        # open file, so it writes the final path directly while holding
+        # the lock; check() still sees the lock and skips the file.
+        if fcntl is not None:
+            write_path = full_path + TEMP_SUFFIX
+        else:  # pragma: no cover
+            write_path = full_path
 
         for count in range(1, 11):
             with cl.suppress(OSError):
@@ -237,19 +326,47 @@ class Disk:
             try:
                 # Another cache may have deleted the directory before
                 # the file could be opened.
-                writer = open(full_path, mode, encoding=encoding)
+                writer = open(write_path, mode, encoding=encoding)
             except OSError:
                 if count == 10:
                     # Give up after 10 tries to open the file.
                     raise
                 continue
 
-            with writer:
-                size = 0
+            # Hold an advisory lock for the lifetime of the write.
+            # Cache.check uses the same lock to tell in-progress value
+            # files apart from files orphaned by a crashed writer.
+            if not _try_lock(writer):
+                writer.close()
+                with cl.suppress(OSError):
+                    os.remove(write_path)
+                if count == 10:
+                    raise OSError(
+                        errno.EAGAIN,
+                        'value file is locked by another process: %s'
+                        % write_path,
+                    )
+                continue
+
+            size = 0
+            try:
                 for chunk in iterator:
                     size += len(chunk)
                     writer.write(chunk)
-                return size
+                writer.flush()
+                os.fsync(writer.fileno())
+                if fcntl is not None:
+                    # Rename is atomic: the final path only appears once
+                    # the contents are complete while the lock stays held
+                    # on the same open file description.
+                    os.replace(write_path, full_path)
+            except BaseException:
+                writer.close()
+                with cl.suppress(OSError):
+                    os.remove(write_path)
+                raise
+
+            return size, writer
 
     def fetch(self, mode, filename, value, read):
         """Convert fields `mode`, `filename`, and `value` from Cache table to
@@ -359,11 +476,11 @@ class JSONDisk(Disk):
         data = super().get(key, raw)
         return json.loads(zlib.decompress(data).decode('utf-8'))
 
-    def store(self, value, read, key=UNKNOWN):
+    def _store(self, value, read, key=UNKNOWN):
         if not read:
             json_bytes = json.dumps(value).encode('utf-8')
             value = zlib.compress(json_bytes, self.compress_level)
-        return super().store(value, read, key=key)
+        return super()._store(value, read, key=key)
 
     def fetch(self, mode, filename, value, read):
         data = super().fetch(mode, filename, value, read)
@@ -729,6 +846,15 @@ class Cache:
                         _disk_remove(filename)
                     raise Timeout from None
 
+        if begin:
+            # (filename, writer) pairs published by nested writes (e.g.
+            # Cache.set called inside Cache.transact). Their locks stay
+            # held until this transaction commits and their files are
+            # removed if it rolls back.
+            pending = self._local.pending_files = []
+        else:
+            pending = None
+
         try:
             yield sql, filenames.append
         except BaseException:
@@ -736,15 +862,64 @@ class Cache:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('ROLLBACK')
+                self._local.pending_files = None
+                for name, writer in pending:
+                    if writer is not None:
+                        writer.close()
+                    if name is not None:
+                        _disk_remove(name)
             raise
         else:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('COMMIT')
+                self._local.pending_files = None
+                for _, writer in pending:
+                    if writer is not None:
+                        writer.close()
             for name in filenames:
                 if name is not None:
                     _disk_remove(name)
+
+    @cl.contextmanager
+    def _publish(self, retry, filename, writer):
+        """Transact and keep the new value file locked until published.
+
+        `writer` is the open handle returned by :meth:`Disk._store` whose
+        advisory lock marks the file as in use. The lock is held through
+        `COMMIT` and released only afterwards. If the transaction fails or
+        times out the file is removed once the handle is closed, so a
+        failed publish does not leave an orphan behind.
+
+        When an outer transaction is already active, this call joins it:
+        the row only becomes durable if that outer transaction commits, so
+        the file is removed if the outer transaction rolls back.
+
+        """
+        # Nested transactions do not BEGIN on their own: the row only
+        # becomes durable when the outermost transaction commits. Hand the
+        # locked handle to that transaction so the file stays protected
+        # until commit and is removed on rollback.
+        nested = threading.get_ident() == self._txn_id
+        if nested and filename is not None:
+            pending = getattr(self._local, 'pending_files', None)
+            if pending is None:
+                pending = self._local.pending_files = []
+            pending.append((filename, writer))
+
+        try:
+            with self._transact(retry, filename) as txn:
+                yield txn
+        except BaseException:
+            if writer is not None:
+                writer.close()
+            if filename is not None:
+                self._disk.remove(filename)
+            raise
+        else:
+            if writer is not None and not nested:
+                writer.close()
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.
@@ -769,7 +944,9 @@ class Cache:
         now = time.time()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
-        size, mode, filename, db_value = self._disk.store(value, read, key=key)
+        size, mode, filename, db_value, writer = self._disk._store(
+            value, read, key=key
+        )
         columns = (expire_time, tag, size, mode, filename, db_value)
 
         # The order of SELECT, UPDATE, and INSERT is important below.
@@ -793,7 +970,7 @@ class Cache:
         # INSERT OR REPLACE aka UPSERT is not used because the old filename may
         # need cleanup.
 
-        with self._transact(retry, filename) as (sql, cleanup):
+        with self._publish(retry, filename, writer) as (sql, cleanup):
             rows = sql(
                 'SELECT rowid, filename FROM Cache'
                 ' WHERE key = ? AND raw = ?',
@@ -989,10 +1166,12 @@ class Cache:
         now = time.time()
         db_key, raw = self._disk.put(key)
         expire_time = None if expire is None else now + expire
-        size, mode, filename, db_value = self._disk.store(value, read, key=key)
+        size, mode, filename, db_value, writer = self._disk._store(
+            value, read, key=key
+        )
         columns = (expire_time, tag, size, mode, filename, db_value)
 
-        with self._transact(retry, filename) as (sql, cleanup):
+        with self._publish(retry, filename, writer) as (sql, cleanup):
             rows = sql(
                 'SELECT rowid, filename, expire_time FROM Cache'
                 ' WHERE key = ? AND raw = ?',
@@ -1055,11 +1234,16 @@ class Cache:
                     raise KeyError(key)
 
                 value = default + delta
-                columns = (None, None) + self._disk.store(
+                _size, mode, fname, db_value, writer = self._disk._store(
                     value, False, key=key
                 )
-                self._row_insert(db_key, raw, now, columns)
-                self._cull(now, sql, cleanup)
+                try:
+                    columns = (None, None, _size, mode, fname, db_value)
+                    self._row_insert(db_key, raw, now, columns)
+                    self._cull(now, sql, cleanup)
+                finally:
+                    if writer is not None:
+                        writer.close()
                 return value
 
             ((rowid, expire_time, filename, value),) = rows
@@ -1069,11 +1253,16 @@ class Cache:
                     raise KeyError(key)
 
                 value = default + delta
-                columns = (None, None) + self._disk.store(
+                _size, mode, fname, db_value, writer = self._disk._store(
                     value, False, key=key
                 )
-                self._row_update(rowid, now, columns)
-                self._cull(now, sql, cleanup)
+                try:
+                    columns = (None, None, _size, mode, fname, db_value)
+                    self._row_update(rowid, now, columns)
+                    self._cull(now, sql, cleanup)
+                finally:
+                    if writer is not None:
+                        writer.close()
                 cleanup(filename)
                 return value
 
@@ -1446,7 +1635,9 @@ class Cache:
         now = time.time()
         raw = True
         expire_time = None if expire is None else now + expire
-        size, mode, filename, db_value = self._disk.store(value, read)
+        size, mode, filename, db_value, writer = self._disk._store(
+            value, read
+        )
         columns = (expire_time, tag, size, mode, filename, db_value)
         order = {'back': 'DESC', 'front': 'ASC'}
         select = (
@@ -1455,7 +1646,7 @@ class Cache:
             ' ORDER BY key %s LIMIT 1'
         ) % order[side]
 
-        with self._transact(retry, filename) as (sql, cleanup):
+        with self._publish(retry, filename, writer) as (sql, cleanup):
             rows = sql(select, (min_key, max_key, raw)).fetchall()
 
             if rows:
@@ -1898,6 +2089,13 @@ class Cache:
         held for a long time. For example, local benchmarking shows that a
         cache with 1,000 file references takes ~60ms to check.
 
+        Value files are written before their database row is published, so
+        the file system may contain files that no row references yet. When
+        `fix` is `True`, such unknown files are removed only after proving
+        no live writer holds their advisory lock; files left behind by
+        crashed writers, failed overwrites, and rolled back transactions
+        are reclaimed as before.
+
         Raises :exc:`Timeout` error when database timeout occurs and `retry` is
         `False` (default).
 
@@ -1973,8 +2171,49 @@ class Cache:
                         message = 'unknown file: %s' % full_path
                         warnings.warn(message, UnknownFileWarning)
 
-                        if fix:
-                            os.remove(full_path)
+                        if not fix:
+                            continue
+
+                        if not LOCK_SUPPORTED:
+                            # Without an advisory-lock primitive there is
+                            # no way to prove the file is abandoned, so
+                            # leave it in place rather than risk deleting a
+                            # value still being published.
+                            warnings.warn(
+                                'cannot verify file is unused, skipped: %s'
+                                % full_path,
+                                UnknownFileWarning,
+                            )
+                            continue
+
+                        # Value files are written under a temporary name
+                        # and atomically renamed, but the database row is
+                        # published separately. An unknown file may still
+                        # belong to a writer inside the publish window, so
+                        # reclaim it only when no process holds its
+                        # advisory lock. A live writer holds the lock from
+                        # the first byte until the transaction commits; a
+                        # crashed writer's lock is released by the
+                        # operating system, so crash leftovers (including
+                        # those from failed overwrites and rolled back
+                        # transactions) are still reclaimed.
+                        try:
+                            probe = open(full_path, 'rb')
+                        except OSError:
+                            # File disappeared between the walk and open:
+                            # a writer published or removed it.
+                            continue
+
+                        with probe:
+                            if _try_lock(probe):
+                                _unlock(probe)
+                                with cl.suppress(OSError):
+                                    os.remove(full_path)
+                            else:
+                                warnings.warn(
+                                    'file in use, skipped: %s' % full_path,
+                                    UnknownFileWarning,
+                                )
 
                 # Check for empty directories.
 
