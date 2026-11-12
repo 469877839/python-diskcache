@@ -487,6 +487,8 @@ class FanoutCache:
                     total += count
                 except Timeout as timeout:
                     total += timeout.args[0]
+                    if not retry:
+                        break
                 else:
                     break
         return total

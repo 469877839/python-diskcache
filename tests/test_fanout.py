@@ -436,10 +436,19 @@ def test_remove_timeout(cache):
     clear = mock.Mock()
 
     shard.clear = clear
-    clear.side_effect = [dc.Timeout(2), 3]
 
     with mock.patch.object(cache, '_shards', [shard]):
-        assert cache.clear() == 5
+        # retry=False: partial count from the Timeout is kept and the shard
+        # is not retried.
+        clear.side_effect = [dc.Timeout(2)]
+        assert cache.clear() == 2
+        assert clear.call_count == 1
+
+        # retry=True: the Timeout is retried until the shard succeeds and
+        # both partial and final counts are summed.
+        clear.side_effect = [dc.Timeout(2), 3]
+        assert cache.clear(retry=True) == 5
+        assert clear.call_count == 3
 
 
 def test_reset_timeout(cache):
