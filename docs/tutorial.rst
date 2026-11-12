@@ -663,6 +663,38 @@ transaction support may be requested.
 The cache shard exists in a subdirectory of the fanout-cache with the given
 name.
 
+.. _tutorial-backups:
+
+Backups
+-------
+
+The :meth:`backup <.Cache.backup>` method copies a cache to a new directory
+while other clients continue to read and write. Large values stored outside
+the database as files are copied together with the database so that the
+result is a complete cache captured at a single point in time.
+
+    >>> import shutil, tempfile
+    >>> source_dir = tempfile.mkdtemp()
+    >>> source = Cache(source_dir)
+    >>> source['key'] = 'value'
+    >>> backup_dir = tempfile.mkdtemp()
+    >>> source.backup(backup_dir)
+    True
+    >>> backup = Cache(backup_dir)
+    >>> backup['key']
+    'value'
+    >>> backup.close()
+    >>> source.close()
+    >>> shutil.rmtree(source_dir, ignore_errors=True)
+    >>> shutil.rmtree(backup_dir, ignore_errors=True)
+
+While the backup runs, value files that are overwritten, deleted, or expired
+are retained in a staging directory inside the cache instead of being removed
+immediately. The staging directory is reclaimed when the backup finishes, or
+by the next cache initialization if the backup process crashed. The backup
+directory is marked incomplete until every file has been copied and verified,
+so a partial backup is never mistaken for a usable cache.
+
 .. _tutorial-recipes:
 
 Recipes

@@ -11,6 +11,7 @@ import os
 import os.path as op
 import pickle
 import pickletools
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -36,6 +37,10 @@ class Constant(tuple):
 
 
 DBNAME = 'cache.db'
+RETENTION_DIRNAME = 'backup-retention'
+BACKUP_INCOMPLETE = '.incomplete'
+BACKUP_COMPLETE = 'backup.ok'
+BACKUP_COPY_BUFFER = 2**20  # 1 MB
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
 
@@ -330,6 +335,48 @@ class Disk:
         with cl.suppress(OSError):
             os.removedirs(full_dir)
 
+    def retain(self, file_path, retain_dir):
+        """Move a file given by `file_path` into `retain_dir` instead of
+        removing it.
+
+        Used during an online backup to keep external value files alive until
+        the backup has captured them. The move is atomic when `retain_dir`
+        lives on the same file system. Returns True when the file is retained,
+        False when it no longer exists. Other OSErrors propagate.
+
+        :param str file_path: relative path to file
+        :param str retain_dir: absolute directory that retains the file
+        :return: bool indicating whether the file was moved
+        :raises OSError: if the file cannot be moved
+
+        """
+        full_path = op.join(self._directory, file_path)
+        full_dir, _ = op.split(full_path)
+        destination = op.join(retain_dir, op.basename(file_path))
+
+        for count in range(1, 11):
+            try:
+                # os.replace overwrites an existing destination atomically.
+                os.replace(full_path, destination)
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise
+                if not op.exists(full_path):
+                    return False
+                # The parent directory may have been removed by another
+                # cache before the file could be moved.
+                with cl.suppress(OSError):
+                    os.makedirs(full_dir)
+                if count == 10:
+                    raise
+                continue
+            else:
+                with cl.suppress(OSError):
+                    os.removedirs(full_dir)
+                return True
+
+        return False
+
 
 class JSONDisk(Disk):
     """Cache key and value using JSON serialization with zlib compression."""
@@ -453,6 +500,12 @@ class Cache:
                         ' and could not be created' % self._directory,
                     ) from None
 
+        if op.exists(op.join(directory, BACKUP_INCOMPLETE)):
+            raise ValueError(
+                'Cache directory "%s" contains an incomplete backup'
+                % directory
+            )
+
         sql = self._sql_retry
 
         # Setup Settings table.
@@ -491,6 +544,11 @@ class Cache:
             if key.startswith('disk_')
         }
         self._disk = disk(directory, **kwargs)
+
+        # Reclaim files left behind by an interrupted backup. A new Cache
+        # instance cannot share an in-progress backup with another process.
+
+        self._reclaim_retention()
 
         # Set cached attributes: updates settings and sets pragmas.
 
@@ -709,7 +767,7 @@ class Cache:
     def _transact(self, retry=False, filename=None):
         sql = self._sql
         filenames = []
-        _disk_remove = self._disk.remove
+        _remove_file = self._remove_file
         tid = threading.get_ident()
         txn_id = self._txn_id
 
@@ -726,7 +784,7 @@ class Cache:
                     if retry:
                         continue
                     if filename is not None:
-                        _disk_remove(filename)
+                        _remove_file(filename)
                     raise Timeout from None
 
         try:
@@ -744,7 +802,66 @@ class Cache:
                 sql('COMMIT')
             for name in filenames:
                 if name is not None:
-                    _disk_remove(name)
+                    _remove_file(name)
+
+    def _retention_dir(self):
+        """Return the retention directory for the current backup, or None."""
+        local_dir = getattr(self._local, 'retention_dir', None)
+
+        if isinstance(local_dir, str):
+            return local_dir
+
+        # Another process may be running a backup. The marker directory
+        # exists only while that backup is in progress.
+
+        directory = op.join(self._directory, RETENTION_DIRNAME)
+
+        if op.isdir(directory):
+            return directory
+
+        return None
+
+    def _remove_file(self, filename):
+        """Remove `filename`, retaining it while a backup is in progress.
+
+        Retained files are moved into the backup retention directory so that
+        an in-progress backup can still capture them. When no backup is in
+        progress, the file is removed outright.
+
+        :param str filename: relative path to file
+
+        """
+        retain_dir = self._retention_dir()
+
+        if retain_dir is not None:
+            try:
+                if self._disk.retain(filename, retain_dir):
+                    return
+            except OSError:
+                # Fall through and remove the file. The backup may fail to
+                # capture the file and will raise, but cache writes must not
+                # be blocked by retention errors.
+                pass
+
+        self._disk.remove(filename)
+
+    def _reclaim_retention(self):
+        """Reclaim the retention directory left by an interrupted backup.
+
+        Called when a Cache is initialized. A newly initialized cache cannot
+        share an in-progress backup with another process, so any retained
+        files are stale and may be removed.
+
+        """
+        directory = op.join(self._directory, RETENTION_DIRNAME)
+
+        for dirpath, _, files in os.walk(directory):
+            for name in files:
+                with cl.suppress(OSError):
+                    os.remove(op.join(dirpath, name))
+
+        with cl.suppress(OSError):
+            os.removedirs(directory)
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.
@@ -1322,7 +1439,7 @@ class Cache:
             return default
         finally:
             if filename is not None:
-                self._disk.remove(filename)
+                self._remove_file(filename)
 
         if expire_time and tag:
             return value, db_expire_time, db_tag
@@ -1591,7 +1708,7 @@ class Cache:
                 continue
             finally:
                 if name is not None:
-                    self._disk.remove(name)
+                    self._remove_file(name)
             break
 
         if expire_time and tag:
@@ -1962,12 +2079,22 @@ class Cache:
 
                 # Check file system against Cache.filename.
 
+                ignored_names = {BACKUP_INCOMPLETE, BACKUP_COMPLETE}
+
                 for dirpath, _, files in os.walk(self._directory):
                     paths = [op.join(dirpath, filename) for filename in files]
                     error = set(paths) - filenames
 
                     for full_path in error:
                         if DBNAME in full_path:
+                            continue
+
+                        if op.basename(full_path) in ignored_names:
+                            continue
+
+                        if RETENTION_DIRNAME in op.relpath(
+                            full_path, self._directory
+                        ).split(op.sep):
                             continue
 
                         message = 'unknown file: %s' % full_path
@@ -1979,6 +2106,11 @@ class Cache:
                 # Check for empty directories.
 
                 for dirpath, dirs, files in os.walk(self._directory):
+                    if RETENTION_DIRNAME in op.relpath(
+                        dirpath, self._directory
+                    ).split(op.sep):
+                        continue
+
                     if not (dirs or files):
                         message = 'empty directory: %s' % dirpath
                         warnings.warn(message, EmptyDirWarning)
@@ -2336,6 +2468,258 @@ class Cache:
         ((page_count,),) = self._sql('PRAGMA page_count').fetchall()
         total_size = self._page_size * page_count + self.reset('size')
         return total_size
+
+    def backup(self, directory):
+        """Backup cache to `directory` while other clients read and write.
+
+        The backup is performed online: other processes and threads may
+        continue to read from and write to the cache while the backup runs.
+        The database snapshot is taken inside a read-only transaction, so
+        concurrent writers are never blocked by the backup.
+
+        The result is a complete and self-contained cache: the database and
+        all externally stored value files are captured at a single,
+        well-defined point in time. Overwrites, deletions, and expirations
+        that occur while the backup runs do not corrupt the result. The
+        backup may be opened directly with ``Cache(directory)`` and every
+        key, value, and expiration time matches the source cache at the
+        captured point in time.
+
+        While the backup runs, value files that are overwritten, deleted, or
+        expired are retained in a staging directory inside the cache rather
+        than removed immediately. The staging directory is reclaimed when the
+        backup finishes, or by the next cache initialization if the backup
+        process crashed.
+
+        The destination directory is marked incomplete before any data is
+        copied and is only marked complete after the database and every
+        referenced value file have been copied and the copy has been
+        verified. A directory without the completion marker is never a valid
+        backup. If the backup fails or is interrupted, the partial contents
+        are removed and the source cache is left unchanged.
+
+        >>> import shutil, tempfile
+        >>> directory = tempfile.mkdtemp()
+        >>> cache = Cache(directory)
+        >>> cache['key'] = 'value'
+        >>> backup_directory = tempfile.mkdtemp()
+        >>> cache.backup(backup_directory)
+        True
+        >>> backup = Cache(backup_directory)
+        >>> backup['key']
+        'value'
+        >>> backup.close()
+        >>> cache.close()
+        >>> shutil.rmtree(directory, ignore_errors=True)
+        >>> shutil.rmtree(backup_directory, ignore_errors=True)
+
+        :param str directory: backup destination directory path
+        :return: True if the backup completed
+        :raises OSError: if `directory` exists and is not empty
+        :raises ValueError: if `directory` matches the cache directory
+
+        """
+        directory = str(directory)
+        directory = op.expanduser(directory)
+        directory = op.expandvars(directory)
+
+        if op.realpath(directory) == op.realpath(self._directory):
+            raise ValueError('backup directory must differ from cache')
+
+        created_directory = False
+
+        if op.exists(directory):
+            if not op.isdir(directory) or os.listdir(directory):
+                message = 'Backup directory "%s" exists and is not empty'
+                raise OSError(errno.EEXIST, message % directory)
+        else:
+            os.makedirs(directory, 0o755)
+            created_directory = True
+
+        # Mark the destination incomplete so that a partial backup is never
+        # mistaken for a usable cache. The marker is replaced by the
+        # completion marker only after every file is copied and verified.
+
+        incomplete_path = op.join(directory, BACKUP_INCOMPLETE)
+
+        with open(incomplete_path, 'wb'):
+            pass
+
+        retention_dir = op.join(self._directory, RETENTION_DIRNAME)
+        created_retention = False
+        completed = False
+
+        try:
+            # Enable staged retention of deleted value files. Writers in
+            # this and other processes move files here instead of removing
+            # them while the backup is in progress.
+
+            try:
+                os.mkdir(retention_dir)
+                created_retention = True
+            except OSError as error:
+                if error.errno != errno.EEXIST:
+                    raise
+                # Another backup is already in progress; share its staging
+                # directory.
+
+            self._local.retention_dir = retention_dir
+
+            filenames = self._backup_snapshot(directory)
+            copied = self._backup_copy_files(
+                directory, retention_dir, filenames
+            )
+            self._backup_verify(directory, copied)
+
+            # The backup is complete. Replace the incomplete marker with the
+            # completion marker.
+
+            complete_path = op.join(directory, BACKUP_COMPLETE)
+
+            with open(complete_path, 'wb'):
+                pass
+
+            os.remove(incomplete_path)
+            completed = True
+            return True
+        finally:
+            if not completed:
+                self._backup_cleanup(
+                    directory, incomplete_path, created_directory
+                )
+
+            if getattr(self._local, 'retention_dir', None) is not None:
+                del self._local.retention_dir
+
+            if created_retention:
+                # Reclaim retained files that were not consumed by the
+                # backup. Another process may still be retaining files, so
+                # ignore errors.
+                self._reclaim_retention()
+
+    def _backup_snapshot(self, directory):
+        """Copy a consistent database snapshot and return its filenames.
+
+        A deferred read transaction in WAL journal mode does not block
+        readers or writers.
+
+        """
+        sql = self._sql
+        sql('BEGIN')
+        try:
+            rows = sql(
+                'SELECT filename FROM Cache WHERE filename IS NOT NULL'
+            ).fetchall()
+            filenames = {filename for (filename,) in rows}
+
+            target = sqlite3.connect(op.join(directory, DBNAME))
+            try:
+                self._con.backup(target)
+            finally:
+                target.close()
+        finally:
+            sql('ROLLBACK')
+
+        return filenames
+
+    def _backup_copy_files(self, directory, retention_dir, filenames):
+        """Copy value files referenced by the database snapshot.
+
+        Files deleted after the snapshot was taken are moved to the
+        retention directory by writers, so each file is sought in both
+        locations.
+
+        """
+        copied = set()
+
+        for filename in filenames:
+            destination = op.join(directory, filename)
+            destination_dir = op.dirname(destination)
+
+            for count in range(1, 11):
+                source_path = op.join(self._directory, filename)
+
+                if not op.exists(source_path):
+                    retained = op.join(retention_dir, op.basename(filename))
+                    if op.exists(retained):
+                        source_path = retained
+                    else:
+                        raise FileNotFoundError(
+                            errno.ENOENT,
+                            'value file missing during backup',
+                            filename,
+                        )
+
+                with cl.suppress(OSError):
+                    os.makedirs(destination_dir)
+
+                try:
+                    self._copy_file(source_path, destination)
+                except OSError as error:
+                    if error.errno != errno.ENOENT or count == 10:
+                        raise
+                    continue
+                break
+
+            copied.add(filename)
+
+        return copied
+
+    @staticmethod
+    def _backup_verify(directory, copied):
+        """Verify the copied database references exactly the copied files."""
+        check = sqlite3.connect(op.join(directory, DBNAME))
+        try:
+            rows = check.execute(
+                'SELECT filename FROM Cache WHERE filename IS NOT NULL'
+            ).fetchall()
+        finally:
+            check.close()
+
+        referenced = {filename for (filename,) in rows}
+
+        if referenced != copied:
+            raise OSError(
+                'backup verification failed: %d files referenced,'
+                ' %d files copied' % (len(referenced), len(copied))
+            )
+
+    @staticmethod
+    def _backup_cleanup(directory, incomplete_path, created_directory):
+        """Remove a partial backup so it is never mistaken for a cache."""
+        if created_directory:
+            shutil.rmtree(directory, ignore_errors=True)
+            return
+
+        with cl.suppress(OSError):
+            os.remove(incomplete_path)
+
+        names = []
+        with cl.suppress(OSError):
+            names = os.listdir(directory)
+
+        for name in names:
+            if name == BACKUP_INCOMPLETE:
+                continue
+
+            path = op.join(directory, name)
+
+            if op.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                with cl.suppress(OSError):
+                    os.remove(path)
+
+    @staticmethod
+    def _copy_file(source_path, destination):
+        """Copy file contents from `source_path` to `destination`."""
+        with open(source_path, 'rb') as reader:
+            with open(destination, 'xb') as writer:
+                while True:
+                    chunk = reader.read(BACKUP_COPY_BUFFER)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
 
     def close(self):
         """Close database connection."""

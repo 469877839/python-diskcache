@@ -1405,3 +1405,351 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+def test_backup(cache):
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache.set('small', 'value')
+    cache.set('large', 'value' * int(1e5))
+    cache.set('expiring', 'value' * int(1e5), expire=1000)
+    cache.set('tagged', 'value', tag='tag')
+
+    assert cache.backup(cache_dir2)
+
+    with dc.Cache(cache_dir2) as cache2:
+        assert cache2['small'] == 'value'
+        assert cache2['large'] == 'value' * int(1e5)
+        assert cache2['tagged'] == 'value'
+        assert cache2.get('tagged', tag=True) == ('value', 'tag')
+
+        value, expire_time = cache2.get('expiring', expire_time=True)
+        assert value == 'value' * int(1e5)
+        assert expire_time is not None
+        assert expire_time > time.time()
+
+        cache2.check()
+
+    shutil.rmtree(cache_dir2, ignore_errors=True)
+
+
+def test_backup_expired_keys(cache):
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache.set('expired', 'value' * int(1e5), expire=0.01)
+    time.sleep(0.05)
+
+    assert cache.backup(cache_dir2)
+
+    with dc.Cache(cache_dir2) as cache2:
+        # Expired rows are preserved but reads treat them as missing.
+        assert 'expired' in list(cache2)
+        assert cache2.get('expired') is None
+
+    shutil.rmtree(cache_dir2, ignore_errors=True)
+
+
+def test_backup_directory_errors(cache):
+    with pytest.raises(ValueError):
+        cache.backup(cache.directory)
+
+    cache_dir2 = tempfile.mkdtemp()
+    with open(op.join(cache_dir2, 'file'), 'wb'):
+        pass
+
+    with pytest.raises(OSError):
+        cache.backup(cache_dir2)
+
+    shutil.rmtree(cache_dir2, ignore_errors=True)
+
+
+def test_backup_failure(cache):
+    from diskcache.core import RETENTION_DIRNAME
+
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache['large'] = 'value' * int(1e5)
+
+    with mock.patch.object(
+        dc.Cache, '_copy_file', side_effect=OSError('boom')
+    ):
+        with pytest.raises(OSError):
+            cache.backup(cache_dir2)
+
+    # Partial backup is removed and never mistaken for a usable cache.
+    assert not op.exists(cache_dir2)
+
+    # The retention staging directory is reclaimed after the failure.
+    assert not op.exists(op.join(cache.directory, RETENTION_DIRNAME))
+
+    # The source cache is unchanged.
+    assert cache['large'] == 'value' * int(1e5)
+    cache.check()
+
+    # A failure while backing up into an existing empty directory leaves
+    # behind only an empty, reusable directory.
+    existing_dir = tempfile.mkdtemp()
+
+    with mock.patch.object(
+        dc.Cache, '_copy_file', side_effect=OSError('boom')
+    ):
+        with pytest.raises(OSError):
+            cache.backup(existing_dir)
+
+    assert op.isdir(existing_dir)
+    assert os.listdir(existing_dir) == []
+
+    shutil.rmtree(existing_dir, ignore_errors=True)
+
+
+def test_backup_snapshot_failure(cache):
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache['large'] = 'value' * int(1e5)
+
+    with mock.patch.object(
+        dc.Cache,
+        '_backup_snapshot',
+        side_effect=sqlite3.OperationalError('boom'),
+    ):
+        with pytest.raises(sqlite3.OperationalError):
+            cache.backup(cache_dir2)
+
+    assert not op.exists(cache_dir2)
+    assert cache['large'] == 'value' * int(1e5)
+    cache.check()
+
+
+def test_backup_retention_reclaim(cache):
+    from diskcache.core import RETENTION_DIRNAME
+
+    cache['large'] = 'value' * int(1e5)
+
+    retention_dir = op.join(cache.directory, RETENTION_DIRNAME)
+    os.makedirs(retention_dir)
+    with open(op.join(retention_dir, 'stale.val'), 'wb') as writer:
+        writer.write(b'stale')
+
+    # Re-initializing the cache reclaims files retained by an interrupted
+    # backup.
+    cache.close()
+    cache.__init__(cache.directory)
+
+    assert not op.exists(retention_dir)
+    assert cache['large'] == 'value' * int(1e5)
+
+
+def test_backup_markers(cache):
+    from diskcache.core import BACKUP_COMPLETE, BACKUP_INCOMPLETE
+
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache['large'] = 'value' * int(1e5)
+    assert cache.backup(cache_dir2)
+
+    assert op.exists(op.join(cache_dir2, BACKUP_COMPLETE))
+    assert not op.exists(op.join(cache_dir2, BACKUP_INCOMPLETE))
+
+    # An interrupted backup leaves an incomplete marker rather than a
+    # usable cache, and such a directory cannot be opened as a cache.
+
+    incomplete_dir = tempfile.mkdtemp()
+    os.makedirs(op.join(incomplete_dir, 'ab'))
+    with open(op.join(incomplete_dir, BACKUP_INCOMPLETE), 'wb'):
+        pass
+    shutil.copy(
+        op.join(cache.directory, 'cache.db'),
+        op.join(incomplete_dir, 'cache.db'),
+    )
+
+    with pytest.raises(ValueError):
+        dc.Cache(incomplete_dir)
+
+    # Backup markers are ignored by the consistency check.
+
+    with open(op.join(cache.directory, BACKUP_COMPLETE), 'wb'):
+        pass
+
+    with warnings.catch_warnings(record=True) as warns:
+        warnings.simplefilter('always')
+        cache.check()
+
+    assert not [
+        warn for warn in warns if warn.category == dc.UnknownFileWarning
+    ]
+
+    os.remove(op.join(cache.directory, BACKUP_COMPLETE))
+
+    shutil.rmtree(cache_dir2, ignore_errors=True)
+    shutil.rmtree(incomplete_dir, ignore_errors=True)
+
+
+def test_backup_retained_overwrite(cache):
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache['key'] = 'old' * int(1e5)
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    original_copy_file = dc.Cache._copy_file
+
+    def copy_file(self, source_path, destination):
+        # Pause mid-copy so the writer can overwrite the key.
+        barrier.wait(timeout=30)
+        return original_copy_file(source_path, destination)
+
+    def writer():
+        try:
+            barrier.wait(timeout=30)
+            cache['key'] = 'new' * int(1e5)
+        except Exception as error:  # pragma: no cover
+            errors.append(error)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    with mock.patch.object(dc.Cache, '_copy_file', copy_file):
+        assert cache.backup(cache_dir2)
+
+    thread.join(timeout=30)
+    assert not errors
+
+    with dc.Cache(cache_dir2) as cache2:
+        # The backup captured the value stored before the snapshot.
+        assert cache2['key'] == 'old' * int(1e5)
+        cache2.check()
+
+    # The overwrite proceeded concurrently with the backup.
+    assert cache['key'] == 'new' * int(1e5)
+
+    shutil.rmtree(cache_dir2, ignore_errors=True)
+
+
+def test_backup_retained_delete(cache):
+    cache_dir2 = tempfile.mkdtemp()
+    shutil.rmtree(cache_dir2)
+
+    cache['key'] = 'value' * int(1e5)
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    original_copy_file = dc.Cache._copy_file
+
+    def copy_file(self, source_path, destination):
+        # Pause mid-copy so the writer can delete the key.
+        barrier.wait(timeout=30)
+        return original_copy_file(source_path, destination)
+
+    def writer():
+        try:
+            barrier.wait(timeout=30)
+            del cache['key']
+        except Exception as error:  # pragma: no cover
+            errors.append(error)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    with mock.patch.object(dc.Cache, '_copy_file', copy_file):
+        assert cache.backup(cache_dir2)
+
+    thread.join(timeout=30)
+    assert not errors
+
+    with dc.Cache(cache_dir2) as cache2:
+        # The deleted value was retained and captured by the backup.
+        assert cache2['key'] == 'value' * int(1e5)
+        cache2.check()
+
+    assert 'key' not in cache
+
+    shutil.rmtree(cache_dir2, ignore_errors=True)
+
+
+def _backup_writer_process(directory, barrier, rounds):
+    """Overwrite and delete keys while a backup runs in another process."""
+    with dc.Cache(directory) as cache:
+        barrier.wait(timeout=60)
+        for round_ in range(rounds):
+            for index in range(5):
+                key = 'churn-%d' % index
+                cache[key] = 'round%d-first' % round_ * int(1e4)
+                cache[key] = 'round%d-second' % round_ * int(1e4)
+                del cache[key]
+
+
+def _backup_reader_process(directory, backup_directory, barrier, queue):
+    """Backup the cache while another process overwrites and deletes."""
+    try:
+        with dc.Cache(directory) as cache:
+            barrier.wait(timeout=60)
+            cache.backup(backup_directory)
+        queue.put(None)
+    except Exception as error:  # pragma: no cover
+        queue.put(error)
+
+
+def test_backup_concurrent_processes():
+    import multiprocessing as mp
+
+    cache_dir = tempfile.mkdtemp()
+    backup_dir = tempfile.mkdtemp()
+    shutil.rmtree(backup_dir)
+
+    try:
+        with dc.Cache(cache_dir) as cache:
+            for index in range(10):
+                cache['stable-%d' % index] = 'value%d' % index * int(1e5)
+            cache.set('expiring', 'value' * int(1e5), expire=1000)
+
+        barrier = mp.Barrier(2)
+        queue = mp.Queue()
+
+        writer = mp.Process(
+            target=_backup_writer_process, args=(cache_dir, barrier, 30)
+        )
+        reader = mp.Process(
+            target=_backup_reader_process,
+            args=(cache_dir, backup_dir, barrier, queue),
+        )
+
+        writer.start()
+        reader.start()
+        writer.join(timeout=120)
+        reader.join(timeout=120)
+
+        assert writer.exitcode == 0
+        assert reader.exitcode == 0
+
+        error = queue.get()
+        assert error is None, error
+
+        with dc.Cache(backup_dir) as backup:
+            # Stable keys and expiration information are captured key by
+            # key, regardless of the concurrent churn writes.
+            for index in range(10):
+                key = 'stable-%d' % index
+                assert backup[key] == 'value%d' % index * int(1e5)
+
+            value, expire_time = backup.get('expiring', expire_time=True)
+            assert value == 'value' * int(1e5)
+            assert expire_time is not None
+            assert expire_time > time.time()
+
+            backup.check()
+
+        # The source cache still opens and reflects the concurrent writes.
+        with dc.Cache(cache_dir) as cache:
+            assert cache['stable-0'] == 'value0' * int(1e5)
+            cache.check()
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.rmtree(backup_dir, ignore_errors=True)
