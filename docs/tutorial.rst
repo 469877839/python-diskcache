@@ -294,6 +294,32 @@ Some users may defer all culling to a cron-like process by setting the
 Each of these methods is designed to work concurrent to others. None of them
 block readers or writers in other threads or processes.
 
+.. _tutorial-multi-tags:
+
+Items may also be associated with multiple tags using the ``tags`` keyword of
+:meth:`set <diskcache.Cache.set>`, :meth:`add <diskcache.Cache.add>`, and
+:meth:`push <diskcache.Cache.push>`. Associations are stored in a separate
+table so tag-based lookups and deletions never deserialize values. The legacy
+``tag`` keyword keeps its meaning and is combined with ``tags``.
+
+    >>> _ = cache.set('a', 1, tags=['source:ods', 'batch:1', 'schema:v1'])
+    >>> _ = cache.set('b', 2, tags=['source:ods', 'batch:2'])
+    >>> cache.keys_by_tags(['batch:1', 'batch:2'])      # Any tag matches.
+    ['a', 'b']
+    >>> cache.keys_by_tags(['source:ods', 'batch:1'], all=True)  # All match.
+    ['a']
+    >>> cache.evict_by_tags(['batch:1'])
+    1
+    >>> cache.clear()
+    1
+
+:meth:`Keys_by_tags <diskcache.Cache.keys_by_tags>` returns keys matching any
+(default) or all of the given tags, excluding expired items.
+:meth:`Evict_by_tags <diskcache.Cache.evict_by_tags>` removes matching items
+in batches of up to one hundred, each batch committed in its own transaction.
+In :class:`FanoutCache <diskcache.FanoutCache>`, each shard is queried and
+evicted independently, so multi-tag eviction is not atomic across shards.
+
 Caches may be iterated by either insertion order or sorted order. The default
 ordering uses insertion order. To iterate by sorted order, use :meth:`iterkeys
 <.Cache.iterkeys>`. The sort order is determined by the database which makes it

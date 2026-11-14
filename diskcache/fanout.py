@@ -99,7 +99,10 @@ class FanoutCache:
                 stack.enter_context(shard_transaction)
             yield
 
-    def set(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def set(
+        self, key, value, expire=None, read=False, tag=None, retry=False,
+        tags=None,
+    ):
         """Set `key` and `value` item in cache.
 
         When `read` is `True`, `value` should be a file-like object opened
@@ -115,13 +118,14 @@ class FanoutCache:
         :param bool read: read value as raw bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of tags to associate with key (default None)
         :return: True if item was set
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.set(key, value, expire, read, tag, retry)
+            return shard.set(key, value, expire, read, tag, retry, tags)
         except Timeout:
             return False
 
@@ -158,7 +162,10 @@ class FanoutCache:
         except Timeout:
             return False
 
-    def add(self, key, value, expire=None, read=False, tag=None, retry=False):
+    def add(
+        self, key, value, expire=None, read=False, tag=None, retry=False,
+        tags=None,
+    ):
         """Add `key` and `value` item to cache.
 
         Similar to `set`, but only add to cache if key not present.
@@ -179,13 +186,14 @@ class FanoutCache:
         :param bool read: read value as bytes from file (default False)
         :param str tag: text to associate with key (default None)
         :param bool retry: retry if database timeout occurs (default False)
+        :param tags: iterable of tags to associate with key (default None)
         :return: True if item was added
 
         """
         index = self._hash(key) % self._count
         shard = self._shards[index]
         try:
-            return shard.add(key, value, expire, read, tag, retry)
+            return shard.add(key, value, expire, read, tag, retry, tags)
         except Timeout:
             return False
 
@@ -452,6 +460,50 @@ class FanoutCache:
 
         """
         return self._remove('evict', args=(tag,), retry=retry)
+
+    def keys_by_tags(self, tags, all=False):
+        """Return keys with tags matching any or all of `tags`.
+
+        With `all` false (default), keys associated with any of the given
+        tags are returned (union). With `all` true, only keys associated
+        with every given tag are returned (intersection).
+
+        Each shard is queried independently and the results are
+        concatenated. Expired items are excluded.
+
+        :param tags: iterable of tags to match
+        :param bool all: require all tags to match (default False, any)
+        :return: list of matching keys
+
+        """
+        keys = (shard.keys_by_tags(tags, all=all) for shard in self._shards)
+        return functools.reduce(operator.iadd, keys, [])
+
+    def evict_by_tags(self, tags, all=False, retry=False):
+        """Remove items with tags matching any or all of `tags`.
+
+        With `all` false (default), items associated with any of the given
+        tags are removed (union). With `all` true, only items associated
+        with every given tag are removed (intersection).
+
+        Atomicity boundary: removal is not atomic across shards. Each
+        shard is evicted independently, and within a shard removal
+        proceeds in batches of up to 100 items, each batch committed in
+        its own transaction. A timeout or crash may therefore leave some
+        shards or batches evicted and others not; the returned count (or
+        the partial count accumulated before a timeout) reflects only
+        items actually removed.
+
+        If database timeout occurs then fails silently unless `retry` is set to
+        `True` (default `False`).
+
+        :param tags: iterable of tags to match
+        :param bool all: require all tags to match (default False, any)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: count of items removed
+
+        """
+        return self._remove('evict_by_tags', args=(tags, all), retry=retry)
 
     def cull(self, retry=False):
         """Cull items from cache until volume is less than size limit.
